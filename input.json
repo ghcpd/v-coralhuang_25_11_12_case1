@@ -1,0 +1,168 @@
+{
+  "meta": {
+    "version": "1.1",
+    "scenario": "Flask pagination audit with heterogeneous upstreams and malformed query patterns",
+    "generated_at": "2025-11-11T12:00:00Z",
+    "purpose": "Provide realistic, mixed-quality request samples for an AI agent to detect pagination/data consistency issues and generate normalization rules across multiple endpoints."
+  },
+  "config": {
+    "per_page": 25,
+    "max_page_allowed": 1000,
+    "max_per_page": 100,
+    "routes": ["/", "/index", "/explore", "/user/<username>", "/api/feed", "/api/users/<username>/posts"],
+    "canonical_params": {
+      "page": ["page", "p"],
+      "per_page": ["per_page", "limit", "size"],
+      "offset": ["offset", "start"]
+    }
+  },
+  "tests": [
+    {
+      "id": "duplicate_page_params",
+      "description": "Frontend and proxy both append `page`, and the parameter order is not stable.",
+      "request_url": "/explore?page=3&sort=ts_desc&filter=followed&page=2",
+      "backend_read": {
+        "raw_getlist_page": ["3", "2"],
+        "flask_behavior": "A typical dev environment takes the first value (3), but in production a reordered query may result in 2."
+      },
+      "observed_result": "Different environments return different pages; pagination links become inconsistent.",
+      "expected_result": "Normalize to the first valid page=3, discard the rest, and emit canonical pagination links with a single page parameter."
+    },
+    {
+      "id": "negative_page_number",
+      "description": "Client submits a negative page value.",
+      "request_url": "/index?page=-1",
+      "backend_read": {
+        "raw_getlist_page": ["-1"]
+      },
+      "observed_result": "paginate() may produce invalid prev/next links or raise.",
+      "expected_result": "Clamp page<=0 to page=1."
+    },
+    {
+      "id": "excessive_page_offset",
+      "description": "Client requests an extremely large page, causing high-offset DB scans.",
+      "request_url": "/explore?page=999999",
+      "backend_read": {
+        "raw_getlist_page": ["999999"]
+      },
+      "observed_result": "SQLAlchemy generates a large OFFSET query, wasting resources.",
+      "expected_result": "Apply max_page_allowed=1000; truncate to 1000 or return a lightweight empty result."
+    },
+    {
+      "id": "duplicate_from_template_and_spa",
+      "description": "Server-side template generates ?page=4, the SPA router reattaches a previous query string with another page value.",
+      "request_url": "/explore?page=4&page=5",
+      "backend_read": {
+        "raw_getlist_page": ["4", "5"]
+      },
+      "observed_result": "Different browsers or proxies may pick a different value, leading to user-visible mismatch.",
+      "expected_result": "Normalize to the first valid integer page=4 and emit pagination links containing only page=4."
+    },
+    {
+      "id": "missing_page_param",
+      "description": "Client visits a user profile without providing `page`.",
+      "request_url": "/user/jack",
+      "backend_read": {
+        "raw_getlist_page": []
+      },
+      "observed_result": "Most code paths work, but direct indexing into request.args can raise.",
+      "expected_result": "Always fallback to page=1 and generate next/prev links with explicit page."
+    },
+    {
+      "id": "array_encoded_page",
+      "description": "Upstream encodes page as an array-like parameter.",
+      "request_url": "/explore?page[]=2&page[]=3&per_page=20",
+      "backend_read": {
+        "raw_args": {
+          "page[]": ["2", "3"],
+          "per_page": ["20"]
+        },
+        "flask_behavior": "Flask's standard parser does not auto-map page[] to page and may ignore it or treat it as non-integer."
+      },
+      "observed_result": "The backend falls back to the default page, so the user thinks they were reset to the first page.",
+      "expected_result": "The normalization layer should map the first valid integer from page[] to page and drop the rest."
+    },
+    {
+      "id": "hybrid_offset_limit_client",
+      "description": "A mobile or legacy SPA client uses offset/limit instead of page/per_page.",
+      "request_url": "/api/feed?offset=50&limit=25",
+      "backend_read": {
+        "raw_args": {
+          "offset": ["50"],
+          "limit": ["25"]
+        }
+      },
+      "observed_result": "Current view only supports page=... and returns the first page or errors.",
+      "expected_result": "Normalize offset/limit to page/per_page: page = offset/limit + 1, per_page = limit, both subject to upper bounds."
+    },
+    {
+      "id": "empty_page_param",
+      "description": "Proxy appends an empty page parameter.",
+      "request_url": "/explore?page=&per_page=25",
+      "backend_read": {
+        "raw_getlist_page": [""]
+      },
+      "observed_result": "Custom converters or strict int casting can raise ValueError.",
+      "expected_result": "Treat empty/blank/NULL as page=1."
+    },
+    {
+      "id": "timestamp_tie_in_feed",
+      "description": "Posts are ordered by timestamp DESC, but several posts have identical timestamps, breaking stable pagination.",
+      "request_url": "/index?page=2",
+      "backend_read": {
+        "raw_getlist_page": ["2"],
+        "query_order": ["timestamp DESC"]
+      },
+      "observed_result": "Refreshing the same page shows duplicated or missing posts near the page boundary.",
+      "expected_result": "Append a secondary deterministic sort key (e.g. id DESC) to enforce stable ordering."
+    },
+    {
+      "id": "session_drift_cached_page",
+      "description": "Paginated view depends on current_user.* but CDN cached the paginated URL and serves it to a different user.",
+      "request_url": "/explore?page=2",
+      "backend_read": {
+        "raw_getlist_page": ["2"],
+        "user_context": "expected user=alice, cached content from user=bob"
+      },
+      "observed_result": "User can see another user's personalized feed, which is a data leakage.",
+      "expected_result": "Mark user-dependent paginated routes as non-cacheable or key the cache by user identity."
+    }
+  ],
+  "error_examples": [
+    {
+      "type": "malformed_param",
+      "raw_query": "page=abc&per_page=50",
+      "risk": "Non-integer page values can raise or lead to unintended fallbacks.",
+      "expected_normalization": {
+        "page": 1,
+        "per_page": 50
+      }
+    },
+    {
+      "type": "abusive_pagination",
+      "raw_query": "page=5000000&per_page=5000",
+      "risk": "Triggers large OFFSET/LIMIT queries and can be used as a resource exhaustion vector.",
+      "expected_normalization": {
+        "page": 1000,
+        "per_page": 100
+      }
+    },
+    {
+      "type": "inconsistent_alias",
+      "raw_query": "p=4&size=10",
+      "risk": "Client uses parameter aliases but the backend does not map them to canonical names, producing pagination drift.",
+      "expected_normalization": {
+        "page": 4,
+        "per_page": 10
+      }
+    }
+  ],
+  "agent_expected_actions": [
+    "Detect and flag requests that contain duplicated, empty, non-integer, or alias-based pagination parameters.",
+    "Produce a normalize_pagination_params(request) proposal that unifies page/per_page/offset/limit/array-like parameters into a single canonical structure.",
+    "Enforce upper bounds (max_page_allowed, max_per_page) and describe the truncation strategy.",
+    "Recommend cache isolation or header-based controls for user-context-dependent paginated views.",
+    "Recommend adding a secondary sort key to timestamp-ordered queries to guarantee deterministic pagination.",
+    "Emit canonical URLs in the output that contain exactly one integer page parameter."
+  ]
+}

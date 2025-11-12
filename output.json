@@ -1,0 +1,25 @@
+{
+  "summary": "Detected categories of pagination inconsistencies and implemented normalization, bounds enforcement, cache isolation hints, and deterministic ordering.",
+  "issues_found": {
+    "duplicate_page_params": "Multiple page params -> normalized by selecting the first valid integer",
+    "negative_page": "Negative page values clamped to 1",
+    "excessive_page": "Large page values are clamped to max_page_allowed; request may return empty to avoid heavy offsets",
+    "page_array_encoding": "page[] arrays mapped to first element",
+    "offset_limit_mapping": "offset/limit converted to page/per_page by integer division",
+    "empty_param": "Empty page values treated as page=1",
+    "timestamp_tie": "Added deterministic tiebreaker (id DESC) for timestamp ordering",
+    "cache_isolation": "Detect user-sensitive requests and recommend cache key isolation"
+  },
+  "applied_changes": [
+    "Added request_normalizer.normalize_pagination_params for canonicalization",
+    "Added models.safe_paginate_query with bounds enforcement and empty-trap for extreme pages",
+    "Added models.apply_deterministic_sort to append id as tiebreaker",
+    "Added unit tests for all described anomalies"
+  ],
+  "recommendations": [
+    "Canonicalize pagination at CDN/gateway before caching",
+    "Use keyset pagination for deep navigation instead of large offsets",
+    "Include user identity in cache key or mark user-specific endpoints as non-cacheable",
+    "Ensure ordering includes deterministic keys when using time-based order_by"
+  ]
+}

@@ -1,51 +1,44 @@
 @echo off
-REM Test runner script for Flask pagination normalization system
-REM Windows
+REM Test runner for Windows
+REM Runs all test suites and generates validation logs
 
-echo ==========================================
-echo Running Pagination Consistency Tests
-echo ==========================================
+setlocal enabledelayedexpansion
+
+echo ===================================================
+echo Pagination Normalization System - Test Suite
+echo ===================================================
 echo.
 
-REM Check if virtual environment exists
-if exist venv (
+REM Check if virtual environment exists, if so activate it
+if exist "venv\Scripts\activate.bat" (
     echo Activating virtual environment...
     call venv\Scripts\activate.bat
-) else (
-    echo Virtual environment not found. Please run setup first.
-    echo Creating virtual environment...
-    python -m venv venv
-    call venv\Scripts\activate.bat
-    echo Installing dependencies...
-    pip install -r requirements.txt
 )
 
-REM Check if dependencies are installed
-echo.
-echo Checking dependencies...
-python -c "import flask; import flask_sqlalchemy" 2>nul || (
-    echo Dependencies not installed. Installing...
-    pip install -r requirements.txt
-)
+REM Create logs directory
+if not exist "logs" mkdir logs
 
-REM Run tests
-echo.
-echo Running test suite...
-echo ----------------------------------------
-python -m pytest test_pagination_consistency.py -v --tb=short
+REM Generate log filename with timestamp
+for /f "tokens=2-4 delims=/ " %%a in ('date /t') do (set mydate=%%c%%a%%b)
+for /f "tokens=1-2 delims=/:" %%a in ('time /t') do (set mytime=%%a%%b)
+set LOG_FILE=logs\test_results_%mydate%_%mytime%.log
 
-REM Run tests from input.json if available
-if exist input.json (
-    echo.
-    echo ==========================================
-    echo Running tests from input.json
-    echo ==========================================
-    python -c "import sys; sys.path.insert(0, '.'); from test_pagination_consistency import run_tests_from_input_json; import json; results = run_tests_from_input_json(); print(f'\nProcessed {len(results[\"test_results\"])} test cases'); print(f'Detected {len(results[\"issues_detected\"])} issues'); print(f'Applied {len(results[\"fixes_validated\"])} fixes'); print('\nTest Results:'); [print(f'  {'✓' if test['status'] == 'passed' else '✗'} {test['test_id']}: {test['description']}') for test in results['test_results']]"
+echo Running pagination normalization unit tests...
+python -m unittest test_pagination_consistency -v > "%LOG_FILE%" 2>&1
+if errorlevel 1 (
+    echo Unit tests had issues - see log file
 )
 
 echo.
-echo ==========================================
-echo Tests completed!
-echo ==========================================
-pause
+echo ===================================================
+echo Running mock gateway demonstration...
+echo ===================================================
+echo.
+python mock_gateway.py >> "%LOG_FILE%" 2>&1
 
+echo.
+echo ===================================================
+echo Test suite complete!
+echo ===================================================
+echo.
+echo Test results saved to: %LOG_FILE%

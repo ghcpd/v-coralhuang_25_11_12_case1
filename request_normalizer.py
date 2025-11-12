@@ -1,398 +1,426 @@
 """
 Centralized pagination parameter normalization and validation module.
 
-This module provides robust handling of pagination parameters across heterogeneous
-environments, including duplicate parameters, malformed inputs, array encodings,
-and parameter aliases.
+This module provides a unified interface for sanitizing, validating, and
+normalizing pagination parameters across heterogeneous client implementations
+and upstream proxies. It handles duplicates, malformed values, parameter aliases,
+and enforces configurable bounds to prevent abuse and inefficiency.
 """
 
-import re
-from typing import Dict, List, Optional, Tuple, Any
-from flask import Request
-from urllib.parse import urlencode, parse_qs, urlparse, urlunparse
+from typing import Dict, Tuple, Optional, Any
+from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
 
 
+@dataclass
 class PaginationConfig:
     """Configuration for pagination normalization."""
-    
-    def __init__(
-        self,
-        default_per_page: int = 25,
-        max_page_allowed: int = 1000,
-        max_per_page: int = 100,
-        min_per_page: int = 1
-    ):
-        self.default_per_page = default_per_page
-        self.max_page_allowed = max_page_allowed
-        self.max_per_page = max_per_page
-        self.min_per_page = min_per_page
-        
-        # Canonical parameter mappings
-        self.page_aliases = ["page", "p"]
-        self.per_page_aliases = ["per_page", "limit", "size"]
-        self.offset_aliases = ["offset", "start"]
+    default_page: int = 1
+    default_per_page: int = 25
+    max_page_allowed: int = 1000
+    max_per_page: int = 100
+    min_per_page: int = 1
 
 
-class NormalizedPaginationParams:
-    """Container for normalized pagination parameters."""
-    
-    def __init__(self, page: int, per_page: int, offset: int = None):
-        self.page = page
-        self.per_page = per_page
-        self.offset = offset  # Calculated offset for SQL queries
-        
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary representation."""
-        result = {
-            "page": self.page,
-            "per_page": self.per_page
-        }
-        if self.offset is not None:
-            result["offset"] = self.offset
-        return result
-    
-    def __repr__(self) -> str:
-        return f"NormalizedPaginationParams(page={self.page}, per_page={self.per_page}, offset={self.offset})"
+@dataclass
+class NormalizedPagination:
+    """Result of pagination parameter normalization."""
+    page: int
+    per_page: int
+    issues: list  # List of detected anomalies
+    original_params: Dict[str, Any]
+    is_modified: bool  # True if any normalization occurred
 
 
 class PaginationNormalizer:
-    """Main normalization engine for pagination parameters."""
+    """
+    Normalizes and validates pagination parameters from Flask request objects.
+    
+    Responsibilities:
+    - Detect and consolidate duplicate parameters
+    - Handle parameter aliases (page/p, per_page/limit/size, offset/start)
+    - Convert offset/limit to page/per_page
+    - Enforce numeric bounds and data type safety
+    - Track all normalization decisions for audit/logging
+    """
     
     def __init__(self, config: Optional[PaginationConfig] = None):
         self.config = config or PaginationConfig()
     
-    def normalize_pagination_params(
-        self,
-        request: Request,
-        config: Optional[PaginationConfig] = None
-    ) -> Tuple[NormalizedPaginationParams, Dict[str, Any]]:
+    def normalize(self, request_args: Dict) -> NormalizedPagination:
         """
-        Normalize pagination parameters from a Flask request.
+        Normalize pagination parameters from a request.
+        
+        Args:
+            request_args: A dict-like object containing query parameters
+                         (typically from Flask's request.args or request.args.to_dict(flat=False))
         
         Returns:
-            Tuple of (NormalizedPaginationParams, metadata_dict)
-            metadata_dict contains information about detected issues and fixes applied.
+            NormalizedPagination object with validated page/per_page values
         """
-        if config is None:
-            config = self.config
-            
-        metadata = {
-            "issues_detected": [],
-            "fixes_applied": [],
-            "original_params": {}
-        }
+        issues = []
+        original_params = dict(request_args)
         
-        # Extract all raw parameters
-        raw_params = self._extract_raw_params(request, metadata)
+        # Extract and validate page parameter
+        page, page_issues = self._extract_page(request_args)
+        issues.extend(page_issues)
         
-        # Normalize page parameter
-        page = self._normalize_page(raw_params, config, metadata)
+        # Extract and validate per_page parameter
+        per_page, per_page_issues = self._extract_per_page(request_args)
+        issues.extend(per_page_issues)
         
-        # Normalize per_page parameter
-        per_page = self._normalize_per_page(raw_params, config, metadata)
+        # Check for offset/limit pattern and convert if present
+        offset_issues, converted_page, converted_per_page = self._handle_offset_limit(
+            request_args, page, per_page
+        )
+        if offset_issues:
+            issues.extend(offset_issues)
+            page, per_page = converted_page, converted_per_page
         
-        # Handle offset/limit conversion if present
-        if self._has_offset_limit(raw_params):
-            page, per_page = self._convert_offset_limit(
-                raw_params, page, per_page, config, metadata
-            )
+        # Apply bounds and clamping
+        (page, per_page), bound_issues = self._apply_bounds(page, per_page)
+        issues.extend(bound_issues)
         
-        # Calculate SQL offset
-        offset = (page - 1) * per_page
+        is_modified = len(issues) > 0
         
-        normalized = NormalizedPaginationParams(page, per_page, offset)
-        
-        return normalized, metadata
+        return NormalizedPagination(
+            page=page,
+            per_page=per_page,
+            issues=issues,
+            original_params=original_params,
+            is_modified=is_modified
+        )
     
-    def _extract_raw_params(
-        self,
-        request: Request,
-        metadata: Dict[str, Any]
-    ) -> Dict[str, List[str]]:
-        """Extract all pagination-related parameters from request."""
-        raw_params = {}
+    def _extract_page(self, request_args: Dict) -> Tuple[int, list]:
+        """
+        Extract and validate the page parameter from request args.
         
-        # Get all query parameters
-        all_params = request.args.to_dict(flat=False)
+        Handles:
+        - Duplicate page parameters (picks first valid)
+        - Parameter aliases (page, p)
+        - Array-like encoding (page[])
+        - Empty/null values
+        - Non-integer values
         
-        # Extract page-related parameters
-        for alias in self.config.page_aliases:
-            if alias in all_params:
-                raw_params[alias] = all_params[alias]
-                metadata["original_params"][alias] = all_params[alias]
+        Returns:
+            Tuple of (page: int, issues: list)
+        """
+        issues = []
         
-        # Extract array-encoded page parameters (e.g., page[]=2&page[]=3)
-        for key in all_params.keys():
-            if key.startswith("page[") or key.startswith("p["):
-                raw_params[key] = all_params[key]
-                metadata["original_params"][key] = all_params[key]
-                metadata["issues_detected"].append(f"Array-encoded parameter detected: {key}")
+        # Check for array-encoded variant (page[])
+        for array_key in ["page[]", "page[0]"]:
+            if array_key in request_args:
+                values = request_args[array_key]
+                if isinstance(values, list):
+                    values = values
+                else:
+                    values = [values]
+                
+                valid_page = self._find_first_valid_integer(values)
+                if valid_page is not None:
+                    if len(values) > 1:
+                        issues.append({
+                            "type": "array_encoded_duplicates",
+                            "param": array_key,
+                            "raw_values": values,
+                            "picked": valid_page,
+                            "severity": "medium"
+                        })
+                    return valid_page, issues
         
-        # Extract per_page-related parameters
-        for alias in self.config.per_page_aliases:
-            if alias in all_params:
-                raw_params[alias] = all_params[alias]
-                metadata["original_params"][alias] = all_params[alias]
+        # Check canonical and aliased page parameters
+        for param_name in ["page", "p"]:
+            if param_name in request_args:
+                values = request_args[param_name]
+                if isinstance(values, list):
+                    raw_values = values
+                else:
+                    raw_values = [values]
+                
+                # Check for duplicates
+                if len(raw_values) > 1:
+                    issues.append({
+                        "type": "duplicate_page_params",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "picked": raw_values[0],
+                        "severity": "high"
+                    })
+                
+                # Extract first value
+                valid_page = self._find_first_valid_integer(raw_values)
+                if valid_page is not None:
+                    return valid_page, issues
+                elif len(raw_values) > 0:
+                    # All values were invalid
+                    issues.append({
+                        "type": "invalid_page_format",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "severity": "high"
+                    })
         
-        # Extract offset-related parameters
-        for alias in self.config.offset_aliases:
-            if alias in all_params:
-                raw_params[alias] = all_params[alias]
-                metadata["original_params"][alias] = all_params[alias]
-        
-        return raw_params
+        # No page parameter found, use default
+        return self.config.default_page, issues
     
-    def _normalize_page(
-        self,
-        raw_params: Dict[str, List[str]],
-        config: PaginationConfig,
-        metadata: Dict[str, Any]
-    ) -> int:
-        """Normalize page parameter, handling duplicates, arrays, and invalid values."""
-        page_values = []
+    def _extract_per_page(self, request_args: Dict) -> Tuple[int, list]:
+        """
+        Extract and validate the per_page parameter from request args.
         
-        # Collect all page values from canonical aliases
-        for alias in config.page_aliases:
-            if alias in raw_params:
-                page_values.extend(raw_params[alias])
+        Handles parameter aliases: per_page, limit, size
         
-        # Handle array-encoded parameters (e.g., page[]=2&page[]=3)
-        for key in raw_params.keys():
-            if key.startswith("page[") or key.startswith("p["):
-                page_values.extend(raw_params[key])
-                metadata["fixes_applied"].append(f"Mapped array parameter {key} to page")
+        Returns:
+            Tuple of (per_page: int, issues: list)
+        """
+        issues = []
         
-        # Detect duplicates
-        if len(page_values) > 1:
-            metadata["issues_detected"].append(
-                f"Duplicate page parameters detected: {page_values}"
-            )
-            metadata["fixes_applied"].append(
-                f"Using first valid page value: {page_values[0]}"
-            )
+        # Check canonical and aliased per_page parameters
+        for param_name in ["per_page", "limit", "size"]:
+            if param_name in request_args:
+                values = request_args[param_name]
+                if isinstance(values, list):
+                    raw_values = values
+                else:
+                    raw_values = [values]
+                
+                # Check for duplicates
+                if len(raw_values) > 1:
+                    issues.append({
+                        "type": "duplicate_per_page_params",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "picked": raw_values[0],
+                        "severity": "medium"
+                    })
+                
+                # Extract first valid integer
+                valid_per_page = self._find_first_valid_integer(raw_values)
+                if valid_per_page is not None:
+                    return valid_per_page, issues
+                elif len(raw_values) > 0:
+                    issues.append({
+                        "type": "invalid_per_page_format",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "severity": "medium"
+                    })
         
-        # Process first valid integer value
-        for value in page_values:
-            normalized = self._safe_int_parse(value, default=None)
-            if normalized is not None and normalized > 0:
-                # Apply bounds
-                if normalized > config.max_page_allowed:
-                    metadata["issues_detected"].append(
-                        f"Page {normalized} exceeds max_page_allowed ({config.max_page_allowed})"
-                    )
-                    metadata["fixes_applied"].append(
-                        f"Clamped page to {config.max_page_allowed}"
-                    )
-                    return config.max_page_allowed
-                return normalized
-        
-        # No valid page found, default to 1
-        if page_values:
-            metadata["issues_detected"].append(
-                f"Invalid page values: {page_values}, defaulting to 1"
-            )
-        else:
-            metadata["fixes_applied"].append("No page parameter found, defaulting to 1")
-        
-        return 1
+        # No per_page parameter found, use default
+        return self.config.default_per_page, issues
     
-    def _normalize_per_page(
-        self,
-        raw_params: Dict[str, List[str]],
-        config: PaginationConfig,
-        metadata: Dict[str, Any]
-    ) -> int:
-        """Normalize per_page parameter."""
-        per_page_values = []
+    def _handle_offset_limit(
+        self, request_args: Dict, page: int, per_page: int
+    ) -> Tuple[list, int, int]:
+        """
+        Handle conversion from offset/limit to page/per_page.
         
-        # Collect all per_page values from canonical aliases
-        for alias in config.per_page_aliases:
-            if alias in raw_params:
-                per_page_values.extend(raw_params[alias])
+        If both offset and limit are present (and page is still default),
+        converts them to page/per_page.
         
-        # Detect duplicates
-        if len(per_page_values) > 1:
-            metadata["issues_detected"].append(
-                f"Duplicate per_page parameters detected: {per_page_values}"
-            )
-            metadata["fixes_applied"].append(
-                f"Using first valid per_page value: {per_page_values[0]}"
-            )
+        Returns:
+            Tuple of (issues: list, page: int, per_page: int)
+        """
+        issues = []
         
-        # Process first valid integer value
-        for value in per_page_values:
-            normalized = self._safe_int_parse(value, default=None)
-            if normalized is not None:
-                # Apply bounds
-                if normalized > config.max_per_page:
-                    metadata["issues_detected"].append(
-                        f"per_page {normalized} exceeds max_per_page ({config.max_per_page})"
-                    )
-                    metadata["fixes_applied"].append(
-                        f"Clamped per_page to {config.max_per_page}"
-                    )
-                    return config.max_per_page
-                if normalized < config.min_per_page:
-                    metadata["issues_detected"].append(
-                        f"per_page {normalized} below min_per_page ({config.min_per_page})"
-                    )
-                    metadata["fixes_applied"].append(
-                        f"Clamped per_page to {config.min_per_page}"
-                    )
-                    return config.min_per_page
-                return normalized
-        
-        # No valid per_page found, use default
-        return config.default_per_page
-    
-    def _has_offset_limit(self, raw_params: Dict[str, List[str]]) -> bool:
-        """Check if request contains offset/limit parameters."""
-        return any(alias in raw_params for alias in self.config.offset_aliases) or \
-               "limit" in raw_params
-    
-    def _convert_offset_limit(
-        self,
-        raw_params: Dict[str, List[str]],
-        current_page: int,
-        current_per_page: int,
-        config: PaginationConfig,
-        metadata: Dict[str, Any]
-    ) -> Tuple[int, int]:
-        """Convert offset/limit to page/per_page if present."""
         offset = None
         limit = None
         
-        # Extract offset
-        for alias in config.offset_aliases:
-            if alias in raw_params:
-                offset_val = self._safe_int_parse(raw_params[alias][0], default=None)
-                if offset_val is not None and offset_val >= 0:
-                    offset = offset_val
-                    break
+        # Check for offset parameter
+        for param_name in ["offset", "start"]:
+            if param_name in request_args:
+                values = request_args[param_name]
+                if isinstance(values, list):
+                    raw_values = values
+                else:
+                    raw_values = [values]
+                
+                if len(raw_values) > 1:
+                    issues.append({
+                        "type": "duplicate_offset_params",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "picked": raw_values[0],
+                        "severity": "medium"
+                    })
+                
+                offset = self._find_first_valid_integer(raw_values)
+                if offset is None and len(raw_values) > 0:
+                    issues.append({
+                        "type": "invalid_offset_format",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "severity": "medium"
+                    })
+                break
         
-        # Extract limit
-        if "limit" in raw_params:
-            limit_val = self._safe_int_parse(raw_params["limit"][0], default=None)
-            if limit_val is not None and limit_val > 0:
-                limit = limit_val
+        # Check for limit parameter (if we're converting from offset/limit)
+        for param_name in ["limit", "size"]:
+            if param_name in request_args and param_name not in ["per_page"]:
+                values = request_args[param_name]
+                if isinstance(values, list):
+                    raw_values = values
+                else:
+                    raw_values = [values]
+                
+                if len(raw_values) > 1:
+                    issues.append({
+                        "type": "duplicate_limit_params",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "picked": raw_values[0],
+                        "severity": "medium"
+                    })
+                
+                limit = self._find_first_valid_integer(raw_values)
+                if limit is None and len(raw_values) > 0:
+                    issues.append({
+                        "type": "invalid_limit_format",
+                        "param": param_name,
+                        "raw_values": raw_values,
+                        "severity": "medium"
+                    })
+                break
         
-        # Convert offset/limit to page/per_page
-        if offset is not None and limit is not None:
-            metadata["fixes_applied"].append(
-                f"Converting offset={offset}, limit={limit} to page/per_page"
-            )
-            # page = (offset / limit) + 1
-            calculated_page = (offset // limit) + 1
-            calculated_per_page = limit
+        # Convert offset/limit to page/per_page if both present
+        if offset is not None and limit is not None and page == self.config.default_page:
+            issues.append({
+                "type": "offset_limit_conversion",
+                "offset": offset,
+                "limit": limit,
+                "converted_page": offset // limit + 1,
+                "converted_per_page": limit,
+                "severity": "info"
+            })
+            page = offset // limit + 1
+            per_page = limit
+        
+        return issues, page, per_page
+    
+    def _apply_bounds(self, page: int, per_page: int) -> Tuple[int, list]:
+        """
+        Apply upper/lower bounds and clamp values to safe ranges.
+        
+        Returns:
+            Tuple of (page: int, issues: list)
+        """
+        issues = []
+        
+        # Clamp page to valid range
+        if page <= 0:
+            issues.append({
+                "type": "negative_or_zero_page",
+                "original_page": page,
+                "clamped_to": self.config.default_page,
+                "severity": "medium"
+            })
+            page = self.config.default_page
+        
+        if page > self.config.max_page_allowed:
+            issues.append({
+                "type": "excessive_page_number",
+                "original_page": page,
+                "max_allowed": self.config.max_page_allowed,
+                "clamped_to": self.config.max_page_allowed,
+                "severity": "high"
+            })
+            page = self.config.max_page_allowed
+        
+        # Clamp per_page to valid range
+        if per_page < self.config.min_per_page:
+            issues.append({
+                "type": "invalid_per_page_range",
+                "original_per_page": per_page,
+                "min_allowed": self.config.min_per_page,
+                "clamped_to": self.config.min_per_page,
+                "severity": "medium"
+            })
+            per_page = self.config.min_per_page
+        
+        if per_page > self.config.max_per_page:
+            issues.append({
+                "type": "excessive_per_page",
+                "original_per_page": per_page,
+                "max_allowed": self.config.max_per_page,
+                "clamped_to": self.config.max_per_page,
+                "severity": "high"
+            })
+            per_page = self.config.max_per_page
+        
+        return (page, per_page), issues
+    
+    @staticmethod
+    def _find_first_valid_integer(values: list) -> Optional[int]:
+        """
+        Find the first valid integer in a list of values.
+        
+        Handles:
+        - String representations of integers
+        - Empty strings
+        - None values
+        - Already-parsed integers
+        
+        Returns:
+            First valid integer or None
+        """
+        for val in values:
+            if val is None or val == "":
+                continue
             
-            # Use converted values if they override current values
-            # (offset/limit takes precedence if both are present)
-            if calculated_page > 0:
-                current_page = calculated_page
-            if calculated_per_page > 0:
-                current_per_page = calculated_per_page
-        elif offset is not None:
-            # Only offset provided, convert using current per_page
-            calculated_page = (offset // current_per_page) + 1
-            if calculated_page > 0:
-                current_page = calculated_page
-                metadata["fixes_applied"].append(
-                    f"Converting offset={offset} to page={current_page} (using per_page={current_per_page})"
-                )
-        elif limit is not None:
-            # Only limit provided, use as per_page
-            current_per_page = limit
-            metadata["fixes_applied"].append(
-                f"Converting limit={limit} to per_page={current_per_page}"
-            )
+            try:
+                if isinstance(val, int):
+                    return val
+                else:
+                    return int(val)
+            except (ValueError, TypeError):
+                continue
         
-        return current_page, current_per_page
-    
-    def _safe_int_parse(self, value: str, default: Optional[int] = None) -> Optional[int]:
-        """
-        Safely parse an integer from a string, handling empty strings and invalid values.
-        
-        Returns None for invalid values, allowing caller to handle defaults.
-        """
-        if not value or not isinstance(value, str):
-            return default
-        
-        value = value.strip()
-        if not value:
-            return default
-        
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            return default
-    
-    def build_canonical_url(
-        self,
-        base_url: str,
-        page: int,
-        per_page: int,
-        preserve_other_params: bool = True,
-        other_params: Optional[Dict[str, Any]] = None
-    ) -> str:
-        """
-        Build a canonical URL with exactly one page and per_page parameter.
-        
-        Args:
-            base_url: Base URL without query string
-            page: Page number
-            per_page: Items per page
-            preserve_other_params: Whether to preserve non-pagination query params
-            other_params: Additional parameters to include (excluding pagination params)
-        """
-        parsed = urlparse(base_url)
-        query_params = {}
-        
-        # Preserve other query parameters if requested
-        if preserve_other_params and parsed.query:
-            existing_params = parse_qs(parsed.query, keep_blank_values=False)
-            for key, values in existing_params.items():
-                # Exclude pagination-related parameters
-                if key not in self.config.page_aliases + \
-                             self.config.per_page_aliases + \
-                             self.config.offset_aliases and \
-                   not key.startswith("page[") and not key.startswith("p["):
-                    query_params[key] = values[0] if len(values) == 1 else values
-        
-        # Add additional parameters
-        if other_params:
-            for key, value in other_params.items():
-                if key not in self.config.page_aliases + \
-                             self.config.per_page_aliases + \
-                             self.config.offset_aliases:
-                    query_params[key] = value
-        
-        # Add canonical pagination parameters
-        query_params["page"] = str(page)
-        if per_page != self.config.default_per_page:
-            query_params["per_page"] = str(per_page)
-        
-        # Rebuild URL
-        new_query = urlencode(query_params, doseq=True)
-        new_parsed = parsed._replace(query=new_query)
-        return urlunparse(new_parsed)
+        return None
 
 
-# Convenience function for direct use
 def normalize_pagination_params(
-    request: Request,
+    request_args: Dict,
     config: Optional[PaginationConfig] = None
-) -> Tuple[NormalizedPaginationParams, Dict[str, Any]]:
+) -> NormalizedPagination:
     """
     Convenience function to normalize pagination parameters.
     
-    Usage:
-        from request_normalizer import normalize_pagination_params
-        
-        @app.route('/explore')
-        def explore():
-            params, metadata = normalize_pagination_params(request)
-            # Use params.page, params.per_page, params.offset
+    Args:
+        request_args: Query parameters from Flask request
+        config: Optional PaginationConfig for customization
+    
+    Returns:
+        NormalizedPagination object
     """
     normalizer = PaginationNormalizer(config)
-    return normalizer.normalize_pagination_params(request, config)
+    return normalizer.normalize(request_args)
 
+
+def build_canonical_url(base_url: str, page: int, per_page: int, **kwargs) -> str:
+    """
+    Build a canonical URL with normalized pagination parameters.
+    
+    Ensures exactly one page parameter and per_page if non-default.
+    
+    Args:
+        base_url: Base URL without query string
+        page: Normalized page number
+        per_page: Normalized per_page value
+        kwargs: Additional query parameters to include
+    
+    Returns:
+        Canonical URL with normalized pagination parameters
+    """
+    params = [f"page={page}"]
+    
+    # Include per_page if non-default or explicitly provided
+    if per_page != 25 or "per_page" in kwargs:
+        params.append(f"per_page={per_page}")
+    
+    # Add other parameters, excluding page-related ones
+    for key, value in kwargs.items():
+        if key not in ["page", "p", "per_page", "limit", "size", "offset", "start"]:
+            params.append(f"{key}={value}")
+    
+    return f"{base_url}?{'&'.join(params)}"

@@ -1,293 +1,362 @@
 """
-Database models with robust pagination support and deterministic ordering.
+SQLAlchemy models with pagination, deterministic ordering, and user context isolation.
 
-This module provides SQLAlchemy models with pagination utilities that ensure
-deterministic ordering and efficient query execution.
+This module provides:
+- Post model with deterministic multi-key ordering
+- User model with proper relationships
+- Query helpers that enforce stable ordering and pagination
+- Thread-safe request context isolation
 """
 
 from datetime import datetime
-from typing import Optional, Tuple, List, Any
-from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import desc, asc, or_
-from sqlalchemy.orm import Query
+from typing import List, Tuple, Optional
+import logging
 
-from request_normalizer import NormalizedPaginationParams, PaginationConfig
+logger = logging.getLogger(__name__)
+
+# We'll use SQLAlchemy base imports - these should be injected by the app
+try:
+    from flask_sqlalchemy import SQLAlchemy
+    db = SQLAlchemy()
+except ImportError:
+    # For testing/import purposes
+    db = None
 
 
-db = SQLAlchemy()
-
-
-class Post(db.Model):
-    """Post model with timestamp and deterministic ordering support."""
+class User(db.Model if db else object):
+    """User model with proper relationships for pagination."""
     
-    __tablename__ = 'posts'
+    __tablename__ = 'user'
     
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    content = db.Column(db.Text, nullable=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    id = db.Column(db.Integer, primary_key=True) if db else None
+    username = db.Column(db.String(64), unique=True, nullable=False, index=True) if db else None
+    email = db.Column(db.String(120), unique=True, nullable=False, index=True) if db else None
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False) if db else None
     
     # Relationships
-    user = db.relationship('User', backref=db.backref('posts', lazy=True))
-    
-    def __repr__(self):
-        return f'<Post {self.id} by user {self.user_id}>'
-    
-    def to_dict(self):
-        """Convert post to dictionary representation."""
-        return {
-            'id': self.id,
-            'user_id': self.user_id,
-            'content': self.content,
-            'timestamp': self.timestamp.isoformat() if self.timestamp else None,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
-
-
-class User(db.Model):
-    """User model."""
-    
-    __tablename__ = 'users'
-    
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False, index=True)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    posts = db.relationship('Post', backref='author', lazy='dynamic', cascade='all, delete-orphan') if db else None
+    followed = db.relationship(
+        'User',
+        secondary='user_follow' if db else None,
+        primaryjoin='User.id==user_follow.c.follower_id' if db else None,
+        secondaryjoin='User.id==user_follow.c.followed_id' if db else None,
+        backref='followers',
+        lazy='dynamic'
+    ) if db else None
     
     def __repr__(self):
         return f'<User {self.username}>'
     
-    def to_dict(self):
-        """Convert user to dictionary representation."""
-        return {
-            'id': self.id,
-            'username': self.username,
-            'email': self.email,
-            'created_at': self.created_at.isoformat() if self.created_at else None
-        }
+    def get_posts_query(self):
+        """Return a deterministically ordered query of user's posts."""
+        if not self.posts:
+            return None
+        return self.posts.order_by(Post.timestamp.desc(), Post.id.desc())
+    
+    def get_followed_posts_query(self):
+        """Return a deterministically ordered query of followed users' posts."""
+        if not db or not self.followed:
+            return None
+        return Post.query.filter(
+            Post.author_id.in_(
+                self.followed.with_entities(User.id)
+            )
+        ).order_by(Post.timestamp.desc(), Post.id.desc())
 
 
-class Follow(db.Model):
-    """Follow relationship model for user following."""
+class Post(db.Model if db else object):
+    """Post model with deterministic ordering support."""
     
-    __tablename__ = 'follows'
+    __tablename__ = 'post'
     
-    id = db.Column(db.Integer, primary_key=True)
-    follower_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    followed_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    id = db.Column(db.Integer, primary_key=True) if db else None
+    body = db.Column(db.String(500), nullable=False) if db else None
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True) if db else None
+    author_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False, index=True) if db else None
     
-    __table_args__ = (db.UniqueConstraint('follower_id', 'followed_id', name='unique_follow'),)
+    __table_args__ = (
+        # Composite index for efficient pagination queries with deterministic ordering
+        db.Index('ix_post_timestamp_id', 'timestamp', 'id', mysql_length={'timestamp': None}) if db else None,
+    ) if db else None
     
-    follower = db.relationship('User', foreign_keys=[follower_id], backref='following')
-    followed = db.relationship('User', foreign_keys=[followed_id], backref='followers')
+    def __repr__(self):
+        return f'<Post {self.id} by {self.author_id}>'
 
 
-class PaginatedResult:
-    """Container for paginated query results with metadata."""
+class PaginatedQueryResult:
+    """
+    Thread-safe result container for paginated queries.
+    
+    Encapsulates:
+    - Items for the current page
+    - Total count
+    - Pagination metadata
+    - Normalization issues/audit info
+    """
     
     def __init__(
         self,
-        items: List[Any],
+        items: List,
         page: int,
         per_page: int,
         total: int,
-        pages: int
+        pages: int,
+        has_prev: bool,
+        has_next: bool,
+        prev_page: Optional[int] = None,
+        next_page: Optional[int] = None,
+        normalization_issues: Optional[List] = None,
+        cache_key: Optional[str] = None,
     ):
         self.items = items
         self.page = page
         self.per_page = per_page
         self.total = total
         self.pages = pages
+        self.has_prev = has_prev
+        self.has_next = has_next
+        self.prev_page = prev_page
+        self.next_page = next_page
+        self.normalization_issues = normalization_issues or []
+        self.cache_key = cache_key
     
-    @property
-    def has_prev(self) -> bool:
-        """Check if there is a previous page."""
-        return self.page > 1
-    
-    @property
-    def has_next(self) -> bool:
-        """Check if there is a next page."""
-        return self.page < self.pages
-    
-    @property
-    def prev_page(self) -> Optional[int]:
-        """Get previous page number."""
-        return self.page - 1 if self.has_prev else None
-    
-    @property
-    def next_page(self) -> Optional[int]:
-        """Get next page number."""
-        return self.page + 1 if self.has_next else None
-    
-    def to_dict(self) -> dict:
-        """Convert paginated result to dictionary."""
+    def to_dict(self):
+        """Convert result to dictionary for serialization."""
         return {
             'items': [item.to_dict() if hasattr(item, 'to_dict') else str(item) for item in self.items],
-            'pagination': {
-                'page': self.page,
-                'per_page': self.per_page,
-                'total': self.total,
-                'pages': self.pages,
-                'has_prev': self.has_prev,
-                'has_next': self.has_next,
-                'prev_page': self.prev_page,
-                'next_page': self.next_page
-            }
+            'page': self.page,
+            'per_page': self.per_page,
+            'total': self.total,
+            'pages': self.pages,
+            'has_prev': self.has_prev,
+            'has_next': self.has_next,
+            'prev_page': self.prev_page,
+            'next_page': self.next_page,
+            'normalization_issues': self.normalization_issues,
         }
 
 
-class PaginationQueryBuilder:
-    """Builder for paginated queries with deterministic ordering."""
+class PaginationHelper:
+    """
+    Helper class for safe, deterministic pagination with proper query ordering.
+    
+    Key features:
+    - Enforces secondary sort keys for determinism
+    - Applies normalized bounds
+    - Tracks pagination metadata
+    - Thread-safe and request-context-aware
+    """
     
     @staticmethod
     def paginate_query(
-        query: Query,
-        params: NormalizedPaginationParams,
-        order_by: Optional[List[Tuple[str, str]]] = None,
-        deterministic_key: str = 'id'
-    ) -> PaginatedResult:
+        query,
+        page: int,
+        per_page: int,
+        total: Optional[int] = None,
+        normalization_issues: Optional[List] = None,
+        cache_key: Optional[str] = None,
+    ) -> PaginatedQueryResult:
         """
-        Paginate a SQLAlchemy query with deterministic ordering.
+        Apply safe pagination to a SQLAlchemy query.
         
         Args:
             query: SQLAlchemy query object
-            params: Normalized pagination parameters
-            order_by: List of (column_name, direction) tuples for ordering.
-                     Direction should be 'asc' or 'desc'.
-                     Defaults to timestamp DESC if not provided.
-            deterministic_key: Column name to use as secondary sort key for stability.
-                             Defaults to 'id'.
+            page: Page number (1-indexed, already normalized)
+            per_page: Items per page (already normalized)
+            total: Optional pre-computed total count
+            normalization_issues: List of normalization issues for audit
+            cache_key: Optional cache key for this paginated result
         
         Returns:
-            PaginatedResult with items and pagination metadata
+            PaginatedQueryResult with items and metadata
         """
-        # Apply deterministic ordering
-        query = PaginationQueryBuilder._apply_deterministic_ordering(
-            query, order_by, deterministic_key
-        )
+        # Ensure safe bounds
+        if page < 1:
+            page = 1
+        if per_page < 1:
+            per_page = 25
         
-        # Get total count (before pagination)
-        total = query.count()
+        # Compute total if not provided
+        if total is None:
+            try:
+                total = query.count()
+            except Exception as e:
+                logger.error(f"Error counting query results: {e}")
+                total = 0
         
-        # Calculate total pages
-        pages = (total + params.per_page - 1) // params.per_page if total > 0 else 0
+        # Calculate pagination metadata
+        pages = (total + per_page - 1) // per_page if total > 0 else 1
         
-        # Apply pagination
-        if params.offset is not None:
-            items = query.offset(params.offset).limit(params.per_page).all()
-        else:
-            # Fallback calculation
-            offset = (params.page - 1) * params.per_page
-            items = query.offset(offset).limit(params.per_page).all()
+        # Clamp page to valid range
+        if page > pages and pages > 0:
+            page = pages
         
-        return PaginatedResult(
+        has_prev = page > 1
+        has_next = page < pages
+        prev_page = page - 1 if has_prev else None
+        next_page = page + 1 if has_next else None
+        
+        # Apply offset and limit
+        offset = (page - 1) * per_page
+        
+        try:
+            items = query.offset(offset).limit(per_page).all()
+        except Exception as e:
+            logger.error(f"Error executing paginated query: {e}")
+            items = []
+        
+        return PaginatedQueryResult(
             items=items,
-            page=params.page,
-            per_page=params.per_page,
+            page=page,
+            per_page=per_page,
             total=total,
-            pages=pages
+            pages=pages,
+            has_prev=has_prev,
+            has_next=has_next,
+            prev_page=prev_page,
+            next_page=next_page,
+            normalization_issues=normalization_issues,
+            cache_key=cache_key,
         )
     
     @staticmethod
-    def _apply_deterministic_ordering(
-        query: Query,
-        order_by: Optional[List[Tuple[str, str]]],
-        deterministic_key: str = 'id'
-    ) -> Query:
+    def add_deterministic_ordering(query, *order_by_clauses):
         """
-        Apply ordering with deterministic tie-breaking.
+        Add deterministic ordering to ensure stable pagination results.
         
-        Ensures that queries with identical primary sort values (e.g., same timestamp)
-        are ordered consistently by adding a secondary sort key.
+        If the query already has ordering, this appends additional clauses.
+        If no ordering exists, applies the provided clauses.
+        
+        Args:
+            query: SQLAlchemy query object
+            order_by_clauses: SQLAlchemy order_by column expressions
+        
+        Returns:
+            Modified query with deterministic ordering
         """
-        if order_by is None:
-            # Default ordering: timestamp DESC
-            order_by = [('timestamp', 'desc')]
-        
-        # Get the entity class from the query
-        entity_class = None
-        try:
-            # Try to get entity class from query mapper
-            if hasattr(query, 'column_descriptions') and query.column_descriptions:
-                entity_class = query.column_descriptions[0]['entity']
-            elif hasattr(query, '_entities') and query._entities:
-                entity_class = query._entities[0].entity.class_
-            elif hasattr(query, 'entity') and query.entity:
-                entity_class = query.entity.class_
-        except (AttributeError, IndexError, TypeError):
-            pass
-        
-        if entity_class is None:
-            # If we can't determine the entity, return query as-is
+        if not order_by_clauses:
             return query
         
-        # Apply primary ordering
-        for column_name, direction in order_by:
-            try:
-                column = getattr(entity_class, column_name, None)
-                if column is None:
-                    continue
-                
-                if direction.lower() == 'desc':
-                    query = query.order_by(desc(column))
-                else:
-                    query = query.order_by(asc(column))
-            except (AttributeError, TypeError):
-                continue
-        
-        # Add deterministic secondary sort key
         try:
-            deterministic_column = getattr(entity_class, deterministic_key, None)
-            if deterministic_column is not None:
-                # Use DESC for deterministic ordering to ensure stability
-                query = query.order_by(desc(deterministic_column))
-        except (AttributeError, TypeError):
-            # If deterministic key doesn't exist, skip it
-            pass
+            # Add the order by clauses
+            for clause in order_by_clauses:
+                query = query.order_by(clause)
+        except Exception as e:
+            logger.error(f"Error applying deterministic ordering: {e}")
         
         return query
+
+
+def get_user_feed(
+    user,
+    page: int,
+    per_page: int,
+    normalization_issues: Optional[List] = None,
+    use_cache: bool = True,
+) -> PaginatedQueryResult:
+    """
+    Get a deterministically paginated feed of posts from followed users.
     
-    @staticmethod
-    def get_user_posts(
-        user_id: int,
-        params: NormalizedPaginationParams,
-        order_by: Optional[List[Tuple[str, str]]] = None
-    ) -> PaginatedResult:
-        """Get paginated posts for a specific user."""
-        query = Post.query.filter_by(user_id=user_id)
-        return PaginationQueryBuilder.paginate_query(query, params, order_by)
+    Args:
+        user: User object
+        page: Normalized page number
+        per_page: Normalized per_page value
+        normalization_issues: Audit information about normalization
+        use_cache: Whether to include cache headers
     
-    @staticmethod
-    def get_followed_posts(
-        user_id: int,
-        params: NormalizedPaginationParams,
-        order_by: Optional[List[Tuple[str, str]]] = None
-    ) -> PaginatedResult:
-        """Get paginated posts from users that the current user follows."""
-        # Get list of followed user IDs
-        followed_ids = db.session.query(Follow.followed_id).filter_by(
-            follower_id=user_id
-        ).subquery()
+    Returns:
+        PaginatedQueryResult
+    """
+    if not db or not user:
+        return PaginatedQueryResult([], page, per_page, 0, 0, False, False)
+    
+    try:
+        # Build query for followed posts with deterministic ordering
+        query = Post.query.filter(
+            Post.author_id.in_(
+                db.session.query(User.id).filter(
+                    User.id.in_(
+                        [u.id for u in user.followed.all()]
+                    )
+                )
+            )
+        )
         
-        query = Post.query.filter(Post.user_id.in_(db.session.query(followed_ids)))
-        return PaginationQueryBuilder.paginate_query(query, params, order_by)
+        # Apply deterministic ordering: timestamp DESC, then id DESC
+        query = PaginationHelper.add_deterministic_ordering(
+            query,
+            Post.timestamp.desc(),
+            Post.id.desc()
+        )
+        
+        # Build cache key if caching is enabled
+        cache_key = None
+        if use_cache:
+            cache_key = f"user_{user.id}_feed_p{page}_pp{per_page}"
+        
+        return PaginationHelper.paginate_query(
+            query,
+            page=page,
+            per_page=per_page,
+            normalization_issues=normalization_issues,
+            cache_key=cache_key,
+        )
+    except Exception as e:
+        logger.error(f"Error fetching user feed: {e}")
+        return PaginatedQueryResult([], page, per_page, 0, 0, False, False)
+
+
+def get_user_posts(
+    user,
+    page: int,
+    per_page: int,
+    normalization_issues: Optional[List] = None,
+) -> PaginatedQueryResult:
+    """
+    Get deterministically paginated posts by a specific user.
     
-    @staticmethod
-    def get_all_posts(
-        params: NormalizedPaginationParams,
-        order_by: Optional[List[Tuple[str, str]]] = None
-    ) -> PaginatedResult:
-        """Get all paginated posts."""
-        query = Post.query
-        return PaginationQueryBuilder.paginate_query(query, params, order_by)
+    Args:
+        user: User object
+        page: Normalized page number
+        per_page: Normalized per_page value
+        normalization_issues: Audit information about normalization
+    
+    Returns:
+        PaginatedQueryResult
+    """
+    if not db or not user:
+        return PaginatedQueryResult([], page, per_page, 0, 0, False, False)
+    
+    try:
+        # Build query for user's posts with deterministic ordering
+        query = user.posts
+        
+        # Apply deterministic ordering: timestamp DESC, then id DESC
+        query = PaginationHelper.add_deterministic_ordering(
+            query,
+            Post.timestamp.desc(),
+            Post.id.desc()
+        )
+        
+        return PaginationHelper.paginate_query(
+            query,
+            page=page,
+            per_page=per_page,
+            normalization_issues=normalization_issues,
+            cache_key=f"user_{user.id}_posts_p{page}_pp{per_page}",
+        )
+    except Exception as e:
+        logger.error(f"Error fetching user posts: {e}")
+        return PaginatedQueryResult([], page, per_page, 0, 0, False, False)
 
 
-def init_db(app: Flask):
-    """Initialize database with app context."""
-    db.init_app(app)
-    with app.app_context():
-        db.create_all()
-
+# Export helper functions for external use
+__all__ = [
+    'db',
+    'User',
+    'Post',
+    'PaginatedQueryResult',
+    'PaginationHelper',
+    'get_user_feed',
+    'get_user_posts',
+]

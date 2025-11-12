@@ -1,61 +1,47 @@
 #!/bin/bash
 
-# Setup script for Flask pagination normalization system
-# Linux/macOS
+# Setup script for Linux/macOS
+# Installs dependencies and sets up the environment
 
 set -e
 
-echo "=========================================="
-echo "Flask Pagination Normalization Setup"
-echo "=========================================="
-echo ""
+echo "==================================================="
+echo "Pagination Normalization System - Setup Script"
+echo "==================================================="
 
 # Check Python version
-echo "Checking Python version..."
-python_version=$(python3 --version 2>&1 | awk '{print $2}')
-echo "Found Python $python_version"
+echo "Checking Python installation..."
+python3 --version || (echo "Python 3 is required" && exit 1)
 
-# Create virtual environment
-echo ""
-echo "Creating virtual environment..."
+# Create virtual environment if it doesn't exist
 if [ ! -d "venv" ]; then
+    echo "Creating virtual environment..."
     python3 -m venv venv
-    echo "Virtual environment created."
-else
-    echo "Virtual environment already exists."
 fi
 
 # Activate virtual environment
-echo ""
 echo "Activating virtual environment..."
 source venv/bin/activate
 
 # Upgrade pip
-echo ""
 echo "Upgrading pip..."
-pip install --upgrade pip
+pip install --upgrade pip setuptools wheel
 
-# Install dependencies
-echo ""
+# Install requirements
 echo "Installing dependencies..."
 pip install -r requirements.txt
 
-# Verify installation
 echo ""
-echo "Verifying installation..."
-python3 -c "import flask; import flask_sqlalchemy; print('✓ Flask and Flask-SQLAlchemy installed successfully')"
-
-echo ""
-echo "=========================================="
+echo "==================================================="
 echo "Setup complete!"
-echo "=========================================="
+echo "==================================================="
 echo ""
 echo "To activate the virtual environment, run:"
 echo "  source venv/bin/activate"
 echo ""
-echo "To run tests, use:"
+echo "To run tests, run:"
 echo "  ./run_test.sh"
-echo "  or"
-echo "  python -m pytest test_pagination_consistency.py -v"
 echo ""
-
+echo "To start the Flask app, run:"
+echo "  python app.py"
+echo ""

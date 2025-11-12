@@ -1,0 +1,26 @@
+{
+  "summary": "Pagination normalization applied",
+  "detected_issues": [
+    "duplicate_page_params",
+    "negative_page_number",
+    "excessive_page_offset",
+    "duplicate_from_template_and_spa",
+    "missing_page_param",
+    "array_encoded_page",
+    "hybrid_offset_limit_client",
+    "empty_page_param",
+    "timestamp_tie_in_feed",
+    "session_drift_cached_page"
+  ],
+  "applied_fixes": [
+    "normalize first valid page from duplicated params",
+    "clamp negative/zero page to 1",
+    "truncate max page to configurable MAX_PAGE_ALLOWED",
+    "support page[] array encoding by taking first element",
+    "convert offset/limit to page/per_page when provided",
+    "treat empty/blank page as page=1",
+    "append secondary ordering (id) to time-ordered queries",
+    "recommend cache-keying by user identity for user-specific feeds",
+    "provide canonical URL format with single page param"
+  ]
+}

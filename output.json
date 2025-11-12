@@ -1,0 +1,135 @@
+{
+  "summary": [
+    {
+      "id": "duplicate_page_params",
+      "request_url": "/explore?page=3&sort=ts_desc&filter=followed&page=2",
+      "normalized": {
+        "page": 3,
+        "per_page": 25,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 3
+        }
+      }
+    },
+    {
+      "id": "negative_page_number",
+      "request_url": "/index?page=-1",
+      "normalized": {
+        "page": 1,
+        "per_page": 25,
+        "offset": null,
+        "clamped": true,
+        "canonical_query": {
+          "page": 1
+        }
+      }
+    },
+    {
+      "id": "excessive_page_offset",
+      "request_url": "/explore?page=999999",
+      "normalized": {
+        "page": 1000,
+        "per_page": 25,
+        "offset": null,
+        "clamped": true,
+        "canonical_query": {
+          "page": 1000
+        }
+      }
+    },
+    {
+      "id": "duplicate_from_template_and_spa",
+      "request_url": "/explore?page=4&page=5",
+      "normalized": {
+        "page": 4,
+        "per_page": 25,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 4
+        }
+      }
+    },
+    {
+      "id": "missing_page_param",
+      "request_url": "/user/jack",
+      "normalized": {
+        "page": 1,
+        "per_page": 25,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 1
+        }
+      }
+    },
+    {
+      "id": "array_encoded_page",
+      "request_url": "/explore?page[]=2&page[]=3&per_page=20",
+      "normalized": {
+        "page": 2,
+        "per_page": 20,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 2,
+          "per_page": 20
+        }
+      }
+    },
+    {
+      "id": "hybrid_offset_limit_client",
+      "request_url": "/api/feed?offset=50&limit=25",
+      "normalized": {
+        "page": 3,
+        "per_page": 25,
+        "offset": 50,
+        "clamped": false,
+        "canonical_query": {
+          "page": 3
+        }
+      }
+    },
+    {
+      "id": "empty_page_param",
+      "request_url": "/explore?page=&per_page=25",
+      "normalized": {
+        "page": 1,
+        "per_page": 25,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 1
+        }
+      }
+    },
+    {
+      "id": "timestamp_tie_in_feed",
+      "request_url": "/index?page=2",
+      "normalized": {
+        "page": 2,
+        "per_page": 25,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 2
+        }
+      }
+    },
+    {
+      "id": "session_drift_cached_page",
+      "request_url": "/explore?page=2",
+      "normalized": {
+        "page": 2,
+        "per_page": 25,
+        "offset": null,
+        "clamped": false,
+        "canonical_query": {
+          "page": 2
+        }
+      }
+    }
+  ]
+}

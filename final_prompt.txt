@@ -1,0 +1,45 @@
+You are a backend reliability engineer responsible for auditing and correcting data consistency, input normalization, and pagination stability issues in a Flask + SQLAlchemy web application that renders dynamic user feeds on multiple endpoints (/, /explore, /user/<username>).
+The audit targets real-world production defects observed under heterogeneous environments—load balancers, API gateways, single-page app routers, and reverse proxies—that introduce inconsistent request semantics, degraded pagination behavior, and inefficient database access patterns.
+While the current pagination logic (page = request.args.get('page', 1, type=int) and paginate(page, POSTS_PER_PAGE, False)) works in controlled development settings, production traces show multiple categories of issues:
+Duplicate and Malformed Query Parameters — Frontend and upstream layers often inject multiple page parameters (e.g., /explore?page=3&page=2), reorder them, or produce invalid ones (page=-1, page=), leading to unpredictable pagination results and missing/duplicate items.
+Extreme Offsets and Database Inefficiency — Unsanitized large page values (e.g., page=999999) cause expensive OFFSET scans in SQLAlchemy, exhausting database resources and delaying responses even when results are empty.
+Inconsistent Parameter Encoding — Some clients or proxies encode page as arrays (page[]=2) or JSON fragments, causing Flask’s parser to silently drop or misinterpret parameters.
+Cross-Layer Caching and Race Conditions — Different cache layers (browser, CDN, gateway, backend) may cache inconsistent query-string variants, creating data mismatches between pages.
+Session and Authentication Drift — When paginated views depend on the current user context (current_user.followed_posts()), missing or duplicated session tokens can yield cross-user data leakage in cached pages.
+Time-Based Query Instability — Posts fetched using order_by(Post.timestamp.desc()) without deterministic tiebreakers (e.g., same-timestamp posts) produce non-repeatable pagination results, breaking deterministic ordering guarantees.
+API Contract Divergence — Mobile and SPA clients implement pagination inconsistently (some use offset and limit, others use page and per_page), resulting in hybrid URL patterns and broken navigation links.
+Your task is to design and implement a robust, multi-layer normalization and validation strategy that ensures deterministic, secure, and efficient pagination across all environments. The system must sanitize all request parameters, enforce safe numeric bounds, preserve order determinism, and provide consistent results regardless of query-string anomalies or client diversity.
+Objectives
+Identify all categories of inconsistent or unsafe pagination behaviors using the provided inputdata.json request dataset.
+Detect potential performance degradation or cache inconsistency patterns caused by malformed requests or duplicated parameters.
+Design and implement a unified normalization pipeline that:
+Validates and sanitizes all pagination-related inputs (page, per_page, offset, etc.).
+Enforces deterministic ordering by augmenting queries with secondary sort keys.
+Applies configurable upper bounds (MAX_PAGE_ALLOWED, MAX_PER_PAGE) to mitigate abusive queries.
+Harmonizes client differences by mapping alternate parameters (offset/limit) to canonical forms.
+Normalizes output URLs to contain exactly one page parameter.
+Ensures thread-safe request context isolation (no cross-request contamination).
+Implement caching-safe mechanisms that invalidate or canonicalize duplicate URLs at the view layer.
+Deliverables
+models.py — Updated pagination and query normalization layer, integrating per-request validation, canonicalization, and deterministic ordering logic.
+request_normalizer.py — Centralized helper module implementing a reusable normalize_pagination_params(request) and input validation functions.
+test_pagination_consistency.py — Automated tests covering malformed query parameters, duplicated inputs, cache divergence, concurrent access, and deterministic ordering validation.
+README.md — Documentation explaining typical cross-layer inconsistencies (frontend duplication, proxy reordering, timestamp instability), the adopted normalization strategy, and operational deployment recommendations.
+output.json — Machine-readable summary of identified issues, applied fixes, and validation results.
+run_test.sh — One-click script to install dependencies, run all test suites, and generate validation logs.
+Environment Replication (Multi-Platform)
+Provide a fully reproducible environment for testing and validation:
+requirements.txt — Explicit dependency list.
+Dockerfile — Containerized build ensuring consistent Flask + SQLAlchemy setup.
+setup.sh — Linux/macOS setup and initialization script.
+run_test.sh — Unified test runner for Linux/macOS.
+run_test.bat — Test runner for Windows.
+mock_gateway.py — Optional mock layer that reproduces proxy parameter duplication and caching anomalies for testing input normalization.
+Evaluation Criteria
+Coverage — Detects and mitigates all listed categories of inconsistencies.
+Robustness — Handles malformed, duplicated, and extreme inputs without crashes or data loss.
+Determinism — Produces stable and repeatable pagination across concurrent requests.
+Performance — Avoids heavy OFFSET scans and redundant queries.
+Reproducibility — All tests run successfully in a clean environment via one command.
+Documentation — Clear explanation of problem classes, normalization logic, and safe deployment patterns.
+Finally, output the runtime of this dialogue.
